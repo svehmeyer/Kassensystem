@@ -1,0 +1,997 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Party Kasse">
+<title>Party Kasse</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+html,body,#root{height:100%;margin:0;padding:0;overflow:hidden}
+body{font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ── KATEGORIEN ────────────────────────────────────────────────────────────────
+const CATEGORIES = ['Alkoholfreie Getränke', 'Softdrinks', 'Alkoholische Getränke', 'Snacks'];
+
+// ── STANDARDARTIKEL ───────────────────────────────────────────────────────────
+const DEFAULT_ARTICLES = [
+  { id:'1',  name:'Wasser medium',    category:'Alkoholfreie Getränke', price:2.00, stock:50,  active:true },
+  { id:'2',  name:'Wasser still',     category:'Alkoholfreie Getränke', price:2.00, stock:50,  active:true },
+  { id:'3',  name:'Bier alkoholfrei', category:'Alkoholfreie Getränke', price:2.80, stock:25,  active:true },
+  { id:'4',  name:'Cola',             category:'Softdrinks',            price:2.50, stock:40,  active:true },
+  { id:'5',  name:'Fanta',            category:'Softdrinks',            price:2.50, stock:35,  active:true },
+  { id:'6',  name:'Sprite',           category:'Softdrinks',            price:2.50, stock:30,  active:true },
+  { id:'7',  name:'Bier',             category:'Alkoholische Getränke', price:3.00, stock:45,  active:true },
+  { id:'8',  name:'Radler',           category:'Alkoholische Getränke', price:3.20, stock:20,  active:true },
+  { id:'9',  name:'Banane',           category:'Snacks',                price:1.50, stock:30,  active:true },
+  { id:'10', name:'Apfel',            category:'Snacks',                price:1.50, stock:25,  active:true },
+  { id:'11', name:'Lutscher',         category:'Snacks',                price:0.50, stock:100, active:true },
+];
+
+// ── MIGRATION alter Kategorienamen ────────────────────────────────────────────
+function migrate(a) {
+  if (a.category !== 'Getränke') return a;
+  if (['Wasser medium','Wasser still','Bier alkoholfrei'].includes(a.name)) return {...a, category:'Alkoholfreie Getränke'};
+  if (['Cola','Fanta','Sprite'].includes(a.name)) return {...a, category:'Softdrinks'};
+  if (['Bier','Radler'].includes(a.name)) return {...a, category:'Alkoholische Getränke'};
+  return {...a, category:'Alkoholfreie Getränke'};
+}
+
+// ── INDEXEDDB ─────────────────────────────────────────────────────────────────
+function openDB() {
+  return new Promise(function(resolve, reject) {
+    var req = indexedDB.open('PartyKasse', 2);
+    req.onerror = function() { reject(req.error); };
+    req.onupgradeneeded = function(e) {
+      var db = e.target.result;
+      if (!db.objectStoreNames.contains('articles')) db.createObjectStore('articles', { keyPath:'id' });
+      if (!db.objectStoreNames.contains('sales'))    db.createObjectStore('sales',    { keyPath:'id' });
+      if (!db.objectStoreNames.contains('bookings')) db.createObjectStore('bookings', { keyPath:'id' });
+    };
+    req.onsuccess = function() { resolve(req.result); };
+  });
+}
+function dbGetAll(store) {
+  return openDB().then(function(db) {
+    return new Promise(function(resolve) {
+      var req = db.transaction(store,'readonly').objectStore(store).getAll();
+      req.onsuccess = function() { resolve(req.result); };
+      req.onerror   = function() { resolve([]); };
+    });
+  });
+}
+function dbPutAll(store, items) {
+  return openDB().then(function(db) {
+    return new Promise(function(resolve) {
+      var tx = db.transaction(store,'readwrite');
+      var s  = tx.objectStore(store);
+      s.clear();
+      items.forEach(function(i) { s.put(i); });
+      tx.oncomplete = resolve;
+    });
+  });
+}
+function dbAdd(store, item) {
+  return openDB().then(function(db) {
+    return new Promise(function(resolve) {
+      var tx = db.transaction(store,'readwrite');
+      tx.objectStore(store).add(item);
+      tx.oncomplete = resolve;
+    });
+  });
+}
+function dbClear(store) {
+  return openDB().then(function(db) {
+    return new Promise(function(resolve) {
+      var tx = db.transaction(store,'readwrite');
+      tx.objectStore(store).clear();
+      tx.oncomplete = resolve;
+    });
+  });
+}
+
+// ── EXCEL EXPORT ──────────────────────────────────────────────────────────────
+function exportBookingsExcel(bookings) {
+  var rows = [];
+  bookings.forEach(function(b) {
+    var d = new Date(b.timestamp);
+    var date = d.toLocaleDateString('de-DE');
+    var time = d.toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'});
+    b.items.forEach(function(item) {
+      rows.push({
+        'Datum': date, 'Uhrzeit': time, 'Buchungs-ID': b.id,
+        'Artikel': item.name, 'Menge': item.quantity,
+        'Einzelpreis': item.price, 'Gesamtpreis': item.totalPrice,
+        'Gegeben': b.paid || '', 'Rueckgeld': b.change != null ? +b.change.toFixed(2) : '',
+        'Trinkgeld': b.tip > 0 ? +b.tip.toFixed(2) : '',
+        'Buchungssumme': b.total
+      });
+    });
+  });
+  var ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{'Hinweis':'Keine Daten'}]);
+  var wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Buchungen');
+  XLSX.writeFile(wb, 'party-kasse-buchungen-' + new Date().toISOString().split('T')[0] + '.xlsx');
+}
+
+function exportStatsExcel(bookings, articles) {
+  var wb = XLSX.utils.book_new();
+  var byDay = {};
+  bookings.forEach(function(b) {
+    var day = new Date(b.timestamp).toLocaleDateString('de-DE');
+    if (!byDay[day]) byDay[day] = {date:day, bookings:0, revenue:0};
+    byDay[day].bookings++;
+    byDay[day].revenue += b.total;
+  });
+  var ws1 = XLSX.utils.json_to_sheet(Object.values(byDay).map(function(d) {
+    return {'Datum':d.date,'Buchungen':d.bookings,'Umsatz':+d.revenue.toFixed(2)};
+  }));
+  XLSX.utils.book_append_sheet(wb, ws1, 'Tagesuebersicht');
+  var artMap = {};
+  bookings.forEach(function(b) {
+    b.items.forEach(function(item) {
+      if (!artMap[item.name]) artMap[item.name] = {name:item.name,qty:0,rev:0};
+      artMap[item.name].qty += item.quantity;
+      artMap[item.name].rev += item.totalPrice;
+    });
+  });
+  var ws2 = XLSX.utils.json_to_sheet(Object.values(artMap).sort(function(a,b){return b.qty-a.qty;}).map(function(a) {
+    return {'Artikel':a.name,'Verkauft':a.qty,'Umsatz':+a.rev.toFixed(2)};
+  }));
+  XLSX.utils.book_append_sheet(wb, ws2, 'Artikel-Statistik');
+  var ws3 = XLSX.utils.json_to_sheet(articles.map(function(a) {
+    return {'Artikel':a.name,'Kategorie':a.category,'Preis':a.price,'Bestand':a.stock,'Status':a.active?'Aktiv':'Inaktiv'};
+  }));
+  XLSX.utils.book_append_sheet(wb, ws3, 'Lagerbestand');
+  XLSX.writeFile(wb, 'party-kasse-statistik-' + new Date().toISOString().split('T')[0] + '.xlsx');
+}
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+function fmtTime(ts) { return new Date(ts).toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'}); }
+function fmtDate(ts) { return new Date(ts).toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit',year:'numeric'}); }
+
+// ── CSS ───────────────────────────────────────────────────────────────────────
+function buildCSS(dark) {
+  var bg      = dark ? '#111827' : '#f3f4f6';
+  var surface = dark ? '#1f2937' : '#ffffff';
+  var card    = dark ? '#374151' : '#f3f4f6';
+  var border  = dark ? '#374151' : '#e5e7eb';
+  var text    = dark ? '#f9fafb' : '#111827';
+  var muted   = dark ? '#9ca3af' : '#6b7280';
+  return [
+    '*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}',
+    'html,body,#root{height:100%;overflow:hidden}',
+    'body{background:' + bg + ';color:' + text + '}',
+    '.app{display:flex;flex-direction:column;height:100vh;background:' + bg + ';color:' + text + ';overflow:hidden;transition:background .2s,color .2s}',
+    '.nav{display:flex;gap:7px;padding:9px 11px;background:' + surface + ';border-bottom:1px solid ' + border + ';flex-shrink:0}',
+    '.nb{flex:1;padding:11px 5px;border:1.5px solid ' + border + ';border-radius:10px;background:' + bg + ';color:' + text + ';font-size:12px;font-weight:600;cursor:pointer;transition:all .15s}',
+    '.nb:hover{background:' + card + '}',
+    '.nb.on{background:#3b82f6;color:#fff;border-color:#3b82f6}',
+    '.sl{display:flex;gap:10px;height:100%;overflow:hidden;padding:11px}',
+    '.ac{flex:1;overflow-y:auto;padding-right:3px;-webkit-overflow-scrolling:touch}',
+    '.cc{width:265px;flex-shrink:0;display:flex;flex-direction:column;align-self:flex-start;position:sticky;top:0}',
+    '@media(max-width:600px){.sl{flex-direction:column;padding:8px}.ac{flex:1;min-height:0}.cc{width:100%;flex-shrink:0;align-self:auto;position:static}}',
+    '.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-bottom:13px}',
+    '.sc{background:' + surface + ';border:1px solid ' + border + ';border-radius:11px;padding:9px 7px;text-align:center}',
+    '.sc-l{font-size:9px;color:' + muted + ';text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}',
+    '.sc-v{font-size:16px;font-weight:700;color:#3b82f6}',
+    '.sec{margin-bottom:15px}',
+    '.st{font-size:10px;font-weight:700;margin-bottom:7px;color:' + muted + ';text-transform:uppercase;letter-spacing:.6px}',
+    '.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(108px,1fr));gap:7px}',
+    '.ab{padding:13px 7px;background:' + surface + ';border:2px solid ' + border + ';border-radius:11px;cursor:pointer;text-align:center;transition:all .15s;color:' + text + ';position:relative}',
+    '.ab:hover:not([disabled]){border-color:#3b82f6;transform:translateY(-1px);box-shadow:0 3px 10px rgba(59,130,246,.18)}',
+    '.ab:active:not([disabled]){transform:scale(.95)}',
+    '.ab[disabled]{opacity:.33;cursor:not-allowed}',
+    '.ab .an{font-size:11px;font-weight:600;margin-bottom:4px}',
+    '.ab .ap{font-size:15px;font-weight:700;color:#3b82f6;margin-bottom:3px}',
+    '.ab .as{font-size:10px;color:' + muted + '}',
+    '.ab .as.low{color:#f59e0b;font-weight:700}',
+    '.bdg{position:absolute;top:4px;right:5px;background:#3b82f6;color:#fff;border-radius:9px;font-size:9px;font-weight:700;padding:1px 5px;line-height:1.4}',
+    '.cart{background:' + surface + ';border:1.5px solid ' + border + ';border-radius:13px;display:flex;flex-direction:column;overflow:hidden}',
+    '.ch{padding:11px 13px;border-bottom:1px solid ' + border + ';display:flex;align-items:center;justify-content:space-between;flex-shrink:0}',
+    '.ct{font-size:13px;font-weight:700}',
+    '.cc-btn{font-size:10px;cursor:pointer;padding:3px 7px;border:1px solid ' + border + ';border-radius:6px;background:transparent;color:' + muted + ';transition:all .15s}',
+    '.cc-btn:hover{border-color:#ef4444;color:#ef4444}',
+    '.cb{max-height:340px;overflow-y:auto;padding:7px;-webkit-overflow-scrolling:touch}',
+    '.ce{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px;color:' + muted + ';font-size:12px;gap:7px;text-align:center}',
+    '.ce-i{font-size:26px;opacity:.35}',
+    '.ci{display:flex;align-items:center;gap:5px;padding:6px 5px;border-radius:8px;margin-bottom:2px}',
+    '.ci:hover{background:' + card + '}',
+    '.cin{flex:1;font-size:11px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.cip{font-size:10px;color:' + muted + ';min-width:38px;text-align:right;flex-shrink:0}',
+    '.qc{display:flex;align-items:center;gap:3px;flex-shrink:0}',
+    '.qb{width:20px;height:20px;border:1.5px solid ' + border + ';border-radius:5px;background:' + bg + ';color:' + text + ';font-size:12px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s}',
+    '.qb:hover{border-color:#3b82f6;color:#3b82f6}',
+    '.qb[disabled]{opacity:.3;cursor:not-allowed}',
+    '.qn{font-size:11px;font-weight:700;min-width:14px;text-align:center}',
+    '.cdl{width:18px;height:18px;border:none;background:transparent;color:' + muted + ';font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:color .15s;flex-shrink:0}',
+    '.cdl:hover{color:#ef4444}',
+    '.cf{padding:11px;border-top:1px solid ' + border + ';flex-shrink:0}',
+    '.lbk{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:' + (dark?'rgba(59,130,246,.12)':'rgba(59,130,246,.07)') + ';border:1px solid ' + (dark?'rgba(59,130,246,.3)':'rgba(59,130,246,.2)') + ';border-radius:9px;margin-bottom:9px;font-size:11px;gap:8px}',
+    '.lbi{color:' + muted + ';flex:1;min-width:0}',
+    '.lbi strong{color:' + text + '}',
+    '.sb{padding:4px 9px;background:transparent;border:1px solid #ef4444;border-radius:6px;color:#ef4444;font-size:10px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap;flex-shrink:0}',
+    '.sb:hover{background:#ef4444;color:#fff}',
+    '.tr{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:9px}',
+    '.tl{font-size:12px;color:' + muted + '}',
+    '.tv{font-size:20px;font-weight:700}',
+    '.bkbtn{width:100%;padding:13px;background:#10b981;border:none;border-radius:10px;color:#fff;font-size:14px;font-weight:700;cursor:pointer;transition:all .15s}',
+    '.bkbtn:hover{background:#059669;transform:translateY(-1px)}',
+    '.bkbtn:active{transform:scale(.97)}',
+    '.bkbtn[disabled]{background:' + border + ';color:' + muted + ';cursor:not-allowed;transform:none}',
+    '.pay-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:1000;padding:14px}',
+    '.pay-modal{background:' + surface + ';border-radius:16px;padding:22px;max-width:340px;width:100%;box-shadow:0 24px 48px rgba(0,0,0,.35)}',
+    '.pay-modal h3{font-size:17px;font-weight:700;margin-bottom:4px}',
+    '.pay-sub{font-size:12px;color:' + muted + ';margin-bottom:16px}',
+    '.pay-total{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:' + card + ';border-radius:10px;margin-bottom:14px}',
+    '.pay-total-lbl{font-size:13px;color:' + muted + '}',
+    '.pay-total-val{font-size:22px;font-weight:700;color:#3b82f6}',
+    '.quick-btns{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px}',
+    '.qkbtn{padding:9px 4px;border:1.5px solid ' + border + ';border-radius:9px;background:' + bg + ';color:' + text + ';font-size:12px;font-weight:600;cursor:pointer;transition:all .15s;text-align:center}',
+    '.qkbtn:hover{border-color:#3b82f6;color:#3b82f6}',
+    '.qkbtn.exact{border-color:#10b981;color:#10b981;background:' + (dark?'rgba(16,185,129,.1)':'rgba(16,185,129,.05)') + '}',
+    '.pay-inp{width:100%;padding:11px 13px;border:1.5px solid ' + border + ';border-radius:10px;background:' + bg + ';color:' + text + ';font-size:18px;font-weight:600;text-align:center;margin-bottom:10px}',
+    '.pay-inp:focus{outline:none;border-color:#3b82f6}',
+    '.tip-row{display:flex;align-items:center;justify-content:space-between;padding:10px 13px;background:' + (dark?'rgba(251,191,36,.1)':'rgba(251,191,36,.08)') + ';border:1px solid ' + (dark?'rgba(251,191,36,.35)':'rgba(251,191,36,.4)') + ';border-radius:10px;margin-bottom:10px;cursor:pointer;transition:all .15s}',
+    '.tip-row.on{background:' + (dark?'rgba(251,191,36,.22)':'rgba(251,191,36,.15)') + ';border-color:#f59e0b}',
+    '.tip-label{font-size:13px;font-weight:600;color:' + (dark?'#fcd34d':'#b45309') + ';display:flex;align-items:center;gap:7px}',
+    '.tip-amount{font-size:13px;font-weight:700;color:' + (dark?'#fcd34d':'#b45309') + '}',
+    '.tip-toggle{width:36px;height:20px;border-radius:10px;background:' + border + ';transition:background .2s;position:relative;flex-shrink:0}',
+    '.tip-toggle.on{background:#f59e0b}',
+    '.tip-toggle::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .2s;box-shadow:0 1px 3px rgba(0,0,0,.2)}',
+    '.tip-toggle.on::after{transform:translateX(16px)}',
+    '.chg-row{display:flex;justify-content:space-between;align-items:center;padding:10px 13px;border-radius:10px;margin-bottom:14px;min-height:42px}',
+    '.chg-row.neu{background:' + card + ';border:1px solid ' + border + '}',
+    '.chg-row.pos{background:' + (dark?'rgba(16,185,129,.12)':'rgba(16,185,129,.08)') + ';border:1px solid ' + (dark?'rgba(16,185,129,.3)':'rgba(16,185,129,.25)') + '}',
+    '.chg-row.neg{background:' + (dark?'rgba(239,68,68,.12)':'rgba(239,68,68,.08)') + ';border:1px solid ' + (dark?'rgba(239,68,68,.3)':'rgba(239,68,68,.25)') + '}',
+    '.chg-lbl{font-size:12px;color:' + muted + '}',
+    '.chg-val{font-size:18px;font-weight:700}',
+    '.chg-val.pos{color:#10b981}',
+    '.chg-val.neg{color:#ef4444}',
+    '.pay-actions{display:flex;gap:8px}',
+    '.pay-ok{flex:1;padding:13px;background:#10b981;border:none;border-radius:10px;color:#fff;font-size:14px;font-weight:700;cursor:pointer;transition:all .15s}',
+    '.pay-ok:hover{background:#059669}',
+    '.pay-ok[disabled]{background:' + border + ';color:' + muted + ';cursor:not-allowed}',
+    '.pay-cancel{padding:13px 16px;border:1.5px solid ' + border + ';border-radius:10px;background:transparent;color:' + muted + ';font-size:14px;font-weight:600;cursor:pointer;transition:all .15s}',
+    '.pay-cancel:hover{border-color:#ef4444;color:#ef4444}',
+    '.conf-overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;z-index:1100;padding:14px}',
+    '.conf-modal{background:' + surface + ';border-radius:16px;padding:24px;max-width:320px;width:100%;box-shadow:0 24px 48px rgba(0,0,0,.4)}',
+    '.conf-icon{font-size:36px;text-align:center;margin-bottom:12px}',
+    '.conf-title{font-size:16px;font-weight:700;margin-bottom:8px;text-align:center}',
+    '.conf-msg{font-size:13px;color:' + muted + ';margin-bottom:20px;text-align:center;line-height:1.5}',
+    '.conf-actions{display:flex;gap:8px}',
+    '.conf-yes{flex:1;padding:12px;background:#ef4444;border:none;border-radius:10px;color:#fff;font-size:14px;font-weight:700;cursor:pointer;transition:all .15s}',
+    '.conf-yes:hover{background:#dc2626}',
+    '.conf-no{flex:1;padding:12px;border:1.5px solid ' + border + ';border-radius:10px;background:transparent;color:' + text + ';font-size:14px;font-weight:600;cursor:pointer;transition:all .15s}',
+    '.conf-no:hover{background:' + card + '}',
+    '.main{flex:1;overflow-y:auto;padding:13px 11px;-webkit-overflow-scrolling:touch}',
+    '.dash-tabs{display:flex;gap:6px;margin-bottom:14px}',
+    '.dash-tab{flex:1;padding:9px 6px;border:1.5px solid ' + border + ';border-radius:9px;background:' + bg + ';color:' + muted + ';font-size:12px;font-weight:600;cursor:pointer;transition:all .15s;text-align:center}',
+    '.dash-tab.on{background:' + surface + ';color:' + text + ';border-color:' + (dark?'#6b7280':'#9ca3af') + '}',
+    '.dg{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-bottom:16px}',
+    '.dc{background:' + surface + ';border:1px solid ' + border + ';border-radius:11px;padding:12px 7px;text-align:center}',
+    '.dl{font-size:9px;color:' + muted + ';text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}',
+    '.dv{font-size:20px;font-weight:700;color:#3b82f6}',
+    '.ds{margin-bottom:16px}',
+    '.ds h2{font-size:13px;font-weight:700;margin-bottom:8px}',
+    '.tl2{display:flex;flex-direction:column;gap:5px}',
+    '.ti{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;background:' + surface + ';border:1px solid ' + border + ';border-radius:9px;font-size:12px}',
+    '.tq{font-weight:700;color:#3b82f6}',
+    '.wi{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;background:rgba(245,158,11,.07);border:1px solid #f59e0b;border-radius:9px;font-size:12px}',
+    '.wq{font-weight:700;color:#f59e0b}',
+    '.wq.crit{color:#ef4444}',
+    '.emp{padding:16px;text-align:center;color:' + muted + ';background:' + surface + ';border-radius:9px;font-size:12px}',
+    '.exp-row{display:flex;gap:6px;margin-bottom:14px}',
+    '.bklist{display:flex;flex-direction:column;gap:8px}',
+    '.bkcard{background:' + surface + ';border:1px solid ' + border + ';border-radius:12px;overflow:hidden}',
+    '.bkhead{display:flex;align-items:center;gap:8px;padding:11px 13px;cursor:pointer}',
+    '.bkhead:hover{background:' + card + '}',
+    '.bkmeta{flex:1;min-width:0}',
+    '.bktime{font-size:11px;color:' + muted + '}',
+    '.bksum{font-size:13px;font-weight:700}',
+    '.bkmoney{display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex-shrink:0}',
+    '.bkpaid{font-size:10px;color:' + muted + '}',
+    '.bkchg{font-size:11px;font-weight:600;color:#10b981}',
+    '.bkchg.exact{color:' + muted + '}',
+    '.bkchg.tip{color:#f59e0b}',
+    '.bkchev{font-size:11px;color:' + muted + ';transition:transform .2s;flex-shrink:0}',
+    '.bkchev.open{transform:rotate(180deg)}',
+    '.bkbody{border-top:1px solid ' + border + ';padding:10px 13px}',
+    '.bkitem{display:flex;justify-content:space-between;align-items:center;font-size:12px;padding:4px 0;border-bottom:1px solid ' + border + '}',
+    '.bkitem:last-of-type{border-bottom:none}',
+    '.bkfoot{display:flex;justify-content:flex-end;gap:6px;padding-top:10px;margin-top:6px;border-top:1px solid ' + border + '}',
+    '.ah{display:flex;flex-direction:column;gap:9px;margin-bottom:16px}',
+    '.row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}',
+    '.sr{flex:1;min-width:140px;padding:9px 12px;border:1.5px solid ' + border + ';border-radius:9px;background:' + bg + ';color:' + text + ';font-size:12px}',
+    '.sr:focus{outline:none;border-color:#3b82f6}',
+    '.btn{padding:9px 12px;border:1.5px solid ' + border + ';border-radius:9px;background:' + surface + ';color:' + text + ';font-size:11px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}',
+    '.btn:hover{background:' + card + '}',
+    '.btn.p{background:#3b82f6;color:#fff;border-color:#3b82f6}',
+    '.btn.p:hover{background:#2563eb}',
+    '.btn.d{background:#ef4444;color:#fff;border-color:#ef4444}',
+    '.btn.d:hover{background:#dc2626}',
+    '.btn.xl{background:#10b981;color:#fff;border-color:#10b981;padding:10px 16px;font-size:12px}',
+    '.btn.xl:hover{background:#059669}',
+    '.btn.s{padding:5px 8px;font-size:10px}',
+    '.btn.g{color:#10b981;border-color:#10b981}',
+    '.btn.m{color:' + muted + '}',
+    '.fr{display:flex;gap:4px}',
+    '.fb{padding:6px 11px;border:1.5px solid ' + border + ';border-radius:7px;background:' + bg + ';color:' + muted + ';font-size:11px;cursor:pointer;transition:all .15s}',
+    '.fb.on{background:#3b82f6;color:#fff;border-color:#3b82f6}',
+    '.tgl{padding:7px 11px;border:1.5px solid ' + border + ';border-radius:9px;background:' + surface + ';cursor:pointer;font-size:16px;line-height:1;transition:all .15s}',
+    '.tgl:hover{background:' + card + '}',
+    '.al{display:flex;flex-direction:column;gap:7px}',
+    '.ar{display:flex;align-items:center;gap:9px;padding:11px;background:' + surface + ';border:1px solid ' + border + ';border-radius:9px;transition:opacity .2s}',
+    '.ar.off{opacity:.38}',
+    '.ai{flex:1;min-width:0}',
+    '.ai .an{font-size:12px;font-weight:600}',
+    '.ai .am{font-size:10px;color:' + muted + ';margin-top:1px}',
+    '.ask{font-size:10px;color:' + muted + ';min-width:70px;text-align:right}',
+    '.acs{display:flex;gap:4px;flex-shrink:0}',
+    '.reset-card{background:' + (dark?'rgba(239,68,68,.1)':'rgba(239,68,68,.05)') + ';border:1.5px solid ' + (dark?'rgba(239,68,68,.3)':'rgba(239,68,68,.2)') + ';border-radius:12px;padding:16px;margin-bottom:16px}',
+    '.reset-card h3{font-size:13px;font-weight:700;color:#ef4444;margin-bottom:6px}',
+    '.reset-card p{font-size:12px;color:' + muted + ';margin-bottom:12px;line-height:1.5}',
+    '.divider{height:1px;background:' + border + ';margin:16px 0}',
+    '.ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:999;padding:14px}',
+    '.mod{background:' + surface + ';border-radius:15px;padding:20px;max-width:360px;width:100%;box-shadow:0 20px 36px rgba(0,0,0,.3)}',
+    '.mod h3{font-size:16px;margin-bottom:12px}',
+    '.ff{width:100%;padding:9px 12px;border:1.5px solid ' + border + ';border-radius:9px;background:' + bg + ';color:' + text + ';font-size:13px;margin-bottom:9px;font-family:inherit}',
+    '.ff:focus{outline:none;border-color:#3b82f6}',
+    '.mf{display:flex;gap:6px;margin-top:10px}',
+    '.mf .btn{flex:1}',
+    '.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#10b981;color:#fff;padding:11px 22px;border-radius:11px;font-size:13px;font-weight:600;z-index:9999;box-shadow:0 8px 20px rgba(0,0,0,.2);animation:fu .3s ease;white-space:nowrap}',
+    '@keyframes fu{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}',
+    '@media(max-width:420px){.grid{grid-template-columns:repeat(auto-fill,minmax(88px,1fr))}}'
+  ].join('\n');
+}
+
+// ── APP ────────────────────────────────────────────────────────────────────────
+function App() {
+  var S = useState;
+  var theme       = S(function(){ return localStorage.getItem('pk-theme') || 'light'; });
+  var view        = S('sales');
+  var articles    = S(DEFAULT_ARTICLES);
+  var sales       = S([]);
+  var bookings    = S([]);
+  var cart        = S({});
+  var lastBooking = S(null);
+  var toast       = S(null);
+  var showPay     = S(false);
+  var payInput    = S('');
+  var noChange    = S(false);
+  var filter      = S('all');
+  var search      = S('');
+  var editId      = S(null);
+  var editBuf     = S({});
+  var showNew     = S(false);
+  var newA        = S({ name:'', category:'Alkoholfreie Getränke', price:'', stock:'' });
+  var dashTab     = S('stats');
+  var openBk      = S(null);
+  var confirm     = S(null);
+  var fileRef     = useRef(null);
+
+  // Destructure state pairs
+  var setTheme       = theme[1];       theme       = theme[0];
+  var setView        = view[1];        view        = view[0];
+  var setArticles    = articles[1];    articles    = articles[0];
+  var setSales       = sales[1];       sales       = sales[0];
+  var setBookings    = bookings[1];    bookings    = bookings[0];
+  var setCart        = cart[1];        cart        = cart[0];
+  var setLastBooking = lastBooking[1]; lastBooking = lastBooking[0];
+  var setToast       = toast[1];       toast       = toast[0];
+  var setShowPay     = showPay[1];     showPay     = showPay[0];
+  var setPayInput    = payInput[1];    payInput    = payInput[0];
+  var setNoChange    = noChange[1];    noChange    = noChange[0];
+  var setFilter      = filter[1];      filter      = filter[0];
+  var setSearch      = search[1];      search      = search[0];
+  var setEditId      = editId[1];      editId      = editId[0];
+  var setEditBuf     = editBuf[1];     editBuf     = editBuf[0];
+  var setShowNew     = showNew[1];     showNew     = showNew[0];
+  var setNewA        = newA[1];        newA        = newA[0];
+  var setDashTab     = dashTab[1];     dashTab     = dashTab[0];
+  var setOpenBk      = openBk[1];      openBk      = openBk[0];
+  var setConfirm     = confirm[1];     confirm     = confirm[0];
+
+  useEffect(function() { localStorage.setItem('pk-theme', theme); }, [theme]);
+
+  useEffect(function() {
+    Promise.all([dbGetAll('articles'), dbGetAll('sales'), dbGetAll('bookings')]).then(function(results) {
+      var a = results[0], s = results[1], b = results[2];
+      if (a.length > 0) {
+        var migrated = a.map(migrate);
+        var changed = migrated.some(function(m,i){ return m.category !== a[i].category; });
+        if (changed) dbPutAll('articles', migrated);
+        setArticles(migrated);
+      }
+      if (s.length > 0) setSales(s);
+      if (b.length > 0) setBookings(b.slice().sort(function(x,y){ return y.timestamp - x.timestamp; }));
+    });
+  }, []);
+
+  function saveArticles(list) {
+    setArticles(list);
+    return dbPutAll('articles', list);
+  }
+
+  function showToastMsg(msg) {
+    setToast(msg);
+    setTimeout(function() { setToast(null); }, 2800);
+  }
+
+  function askConfirm(title, msg, icon, onYes) {
+    setConfirm({ title:title, msg:msg, icon:icon, onYes:onYes });
+  }
+
+  // ── WARENKORB ──────────────────────────────────────────────────────────────
+  function addToCart(a) {
+    setCart(function(prev) {
+      var qty = ((prev[a.id] && prev[a.id].quantity) || 0) + 1;
+      if (qty > a.stock) return prev;
+      var next = Object.assign({}, prev);
+      next[a.id] = { article:a, quantity:qty };
+      return next;
+    });
+  }
+  function changeQty(id, d) {
+    setCart(function(prev) {
+      var e = prev[id]; if (!e) return prev;
+      var q = e.quantity + d;
+      if (q <= 0) { var n = Object.assign({}, prev); delete n[id]; return n; }
+      if (q > e.article.stock) return prev;
+      var next = Object.assign({}, prev);
+      next[id] = Object.assign({}, e, { quantity:q });
+      return next;
+    });
+  }
+  function removeFromCart(id) {
+    setCart(function(prev) { var n = Object.assign({}, prev); delete n[id]; return n; });
+  }
+  function clearCart() { setCart({}); }
+
+  var cartItems = Object.values(cart);
+  var cartTotal = cartItems.reduce(function(s,i){ return s + i.article.price * i.quantity; }, 0);
+  var cartCount = cartItems.reduce(function(s,i){ return s + i.quantity; }, 0);
+  var paidNum   = parseFloat(payInput.replace(',','.')) || 0;
+  var rawChange = paidNum - cartTotal;
+
+  var quickAmounts = (function() {
+    var cands = [5,10,20,50,100].filter(function(v){ return v >= cartTotal; });
+    return [cartTotal].concat(cands.slice(0,2)).slice(0,4);
+  })();
+
+  // ── BUCHEN ─────────────────────────────────────────────────────────────────
+  function handleBook() {
+    if (!cartItems.length) return;
+    var now  = Date.now();
+    var bid  = 'b-' + now;
+    var paid = paidNum || cartTotal;
+    var tip  = (noChange && paidNum > cartTotal + 0.001) ? +(paidNum - cartTotal).toFixed(2) : 0;
+    var chg  = noChange ? 0 : paid - cartTotal;
+
+    var updatedArticles = articles.map(function(a) {
+      var item = cart[a.id];
+      return item ? Object.assign({}, a, { stock: Math.max(0, a.stock - item.quantity) }) : a;
+    });
+
+    var records = cartItems.map(function(i) {
+      return {
+        id: bid + '-' + i.article.id, bookingId:bid, timestamp:now,
+        articleId:i.article.id, articleName:i.article.name,
+        quantity:i.quantity, price:i.article.price, totalPrice:i.article.price * i.quantity
+      };
+    });
+
+    var bkHead = {
+      id:bid, timestamp:now, total:cartTotal, paid:paid, change:chg, tip:tip,
+      items: cartItems.map(function(i) {
+        return { id:i.article.id, name:i.article.name, category:i.article.category||'',
+          quantity:i.quantity, price:i.article.price, totalPrice:i.article.price*i.quantity };
+      })
+    };
+
+    Promise.all(records.map(function(r){ return dbAdd('sales',r); }))
+      .then(function(){ return dbAdd('bookings', bkHead); })
+      .then(function(){
+        setSales(function(prev){ return records.concat(prev); });
+        setBookings(function(prev){ return [bkHead].concat(prev); });
+        saveArticles(updatedArticles);
+        setLastBooking({ bookingId:bid, items:cartItems, timestamp:now, total:cartTotal });
+        setCart({});
+        setShowPay(false);
+        setPayInput('');
+        setNoChange(false);
+        var msg = '✓ Gebucht · € ' + cartTotal.toFixed(2);
+        if (tip > 0) msg += '  |  🎉 Trinkgeld: € ' + tip.toFixed(2);
+        else if (chg > 0.001) msg += '  |  Rückgeld: € ' + chg.toFixed(2);
+        showToastMsg(msg);
+      });
+  }
+
+  // ── STORNO ─────────────────────────────────────────────────────────────────
+  function stornoBooking(b) {
+    var bid = b.id;
+    var restored = articles.map(function(a) {
+      var item = b.items.find(function(i){ return i.id === a.id; });
+      return item ? Object.assign({}, a, { stock: a.stock + item.quantity }) : a;
+    });
+    var newSales    = sales.filter(function(s){ return s.bookingId !== bid; });
+    var newBookings = bookings.filter(function(x){ return x.id !== bid; });
+    setSales(newSales);
+    setBookings(newBookings);
+    Promise.all([dbPutAll('sales', newSales), dbPutAll('bookings', newBookings)]).then(function(){
+      saveArticles(restored);
+    });
+    if (lastBooking && lastBooking.bookingId === bid) setLastBooking(null);
+    setOpenBk(null);
+    showToastMsg('↶ Buchung storniert & Lager wiederhergestellt');
+  }
+
+  function deleteBooking(b) {
+    var bid = b.id;
+    var newSales    = sales.filter(function(s){ return s.bookingId !== bid; });
+    var newBookings = bookings.filter(function(x){ return x.id !== bid; });
+    setSales(newSales);
+    setBookings(newBookings);
+    dbPutAll('sales', newSales);
+    dbPutAll('bookings', newBookings);
+    if (lastBooking && lastBooking.bookingId === bid) setLastBooking(null);
+    setOpenBk(null);
+    showToastMsg('🗑 Buchung gelöscht');
+  }
+
+  function handleFullReset() {
+    setSales([]); setBookings([]); setCart({}); setLastBooking(null);
+    dbClear('sales'); dbClear('bookings');
+    showToastMsg('✓ Kasse zurückgesetzt!');
+  }
+
+  // ── ADMIN ──────────────────────────────────────────────────────────────────
+  function toggleActive(id) { saveArticles(articles.map(function(a){ return a.id===id ? Object.assign({},a,{active:!a.active}) : a; })); }
+  function handleSaveEdit() {
+    saveArticles(articles.map(function(a){ return a.id===editId ? Object.assign({},a,editBuf) : a; }));
+    setEditId(null);
+  }
+  function handleDeleteArt(id) { saveArticles(articles.filter(function(a){ return a.id!==id; })); setEditId(null); }
+  function handleAddNew() {
+    if (!newA.name || newA.price==='') return;
+    saveArticles(articles.concat([{ id:''+Date.now(), name:newA.name, category:newA.category, price:parseFloat(newA.price)||0, stock:parseInt(newA.stock)||0, active:true }]));
+    setNewA({ name:'', category:'Alkoholfreie Getränke', price:'', stock:'' });
+    setShowNew(false);
+  }
+  function handleExportCSV() {
+    var csv = 'name,category,price,stock,active\n' + articles.map(function(a){ return a.name+','+a.category+','+a.price+','+a.stock+','+a.active; }).join('\n');
+    var url = URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+    var el  = document.createElement('a');
+    el.href = url; el.download = 'kasse-artikel-'+new Date().toISOString().split('T')[0]+'.csv';
+    el.click();
+  }
+  function handleImport(e) {
+    var file = e.target.files && e.target.files[0]; if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function(ev) {
+      try {
+        var imported = ev.target.result.split('\n').slice(1).filter(Boolean).map(function(line,i){
+          var p = line.split(',');
+          return { id:'imp-'+i+'-'+Date.now(), name:(p[0]||'').trim(), category:(p[1]||'Alkoholfreie Getränke').trim(), price:parseFloat(p[2])||0, stock:parseInt(p[3])||0, active:(p[4]||'').trim()==='true' };
+        });
+        saveArticles(articles.concat(imported));
+        showToastMsg('✓ ' + imported.length + ' Artikel importiert');
+      } catch(err) { alert('Import fehlgeschlagen'); }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  }
+
+  // ── BERECHNUNGEN ───────────────────────────────────────────────────────────
+  var totalRev = sales.reduce(function(s,x){ return s+x.totalPrice; }, 0);
+  var totalTx  = bookings.length;
+
+  var byCategory = CATEGORIES.map(function(cat) {
+    return { cat:cat, list:articles.filter(function(a){ return a.active && a.category===cat; }) };
+  }).filter(function(g){ return g.list.length > 0; });
+
+  var filtered = articles.filter(function(a) {
+    if (filter==='active'   && !a.active) return false;
+    if (filter==='inactive' &&  a.active) return false;
+    if (search && a.name.toLowerCase().indexOf(search.toLowerCase()) === -1) return false;
+    return true;
+  });
+
+  var today    = new Date().toDateString();
+  var ts       = sales.filter(function(s){ return new Date(s.timestamp).toDateString()===today; });
+  var tBk      = bookings.filter(function(b){ return new Date(b.timestamp).toDateString()===today; });
+  var tRev     = ts.reduce(function(s,x){ return s+x.totalPrice; }, 0);
+  var tTx      = tBk.length;
+  var tAvg     = tTx>0 ? tRev/tTx : 0;
+  var artCount = {};
+  ts.forEach(function(s){ artCount[s.articleName] = (artCount[s.articleName]||0) + s.quantity; });
+  var top5     = Object.entries(artCount).sort(function(a,b){ return b[1]-a[1]; }).slice(0,5);
+  var low      = articles.filter(function(a){ return a.active && a.stock<=5; });
+  var dark     = theme==='dark';
+
+  function openEdit(a) { setEditBuf({name:a.name,category:a.category,price:a.price,stock:a.stock}); setEditId(a.id); }
+
+  // ── RENDER ─────────────────────────────────────────────────────────────────
+  return (
+    <div>
+      <style dangerouslySetInnerHTML={{__html: buildCSS(dark)}} />
+      {toast && <div className="toast">{toast}</div>}
+
+      {confirm && (
+        <div className="conf-overlay" onClick={function(){ setConfirm(null); }}>
+          <div className="conf-modal" onClick={function(e){ e.stopPropagation(); }}>
+            <div className="conf-icon">{confirm.icon}</div>
+            <div className="conf-title">{confirm.title}</div>
+            <div className="conf-msg">{confirm.msg}</div>
+            <div className="conf-actions">
+              <button className="conf-no"  onClick={function(){ setConfirm(null); }}>Abbrechen</button>
+              <button className="conf-yes" onClick={function(){ confirm.onYes(); setConfirm(null); }}>Ja, fortfahren</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="app">
+        <nav className="nav">
+          {[['sales','💰 Verkauf'],['dashboard','📊 Dashboard'],['admin','⚙️ Verwaltung']].map(function(item) {
+            return <button key={item[0]} className={'nb' + (view===item[0]?' on':'')} onClick={function(){ setView(item[0]); }}>{item[1]}</button>;
+          })}
+        </nav>
+
+        {/* ── VERKAUF ──────────────────────────────────────────────────── */}
+        {view==='sales' && (
+          <div className="sl">
+            <div className="ac">
+              <div className="stats">
+                <div className="sc"><div className="sc-l">Gesamtumsatz</div><div className="sc-v">€ {totalRev.toFixed(2)}</div></div>
+                <div className="sc"><div className="sc-l">Buchungen</div><div className="sc-v">{totalTx}</div></div>
+                <div className="sc"><div className="sc-l">Ø/Buchung</div><div className="sc-v">€ {totalTx>0?(totalRev/totalTx).toFixed(2):'0.00'}</div></div>
+              </div>
+              {byCategory.map(function(g) {
+                return (
+                  <div className="sec" key={g.cat}>
+                    <div className="st">{g.cat}</div>
+                    <div className="grid">
+                      {g.list.map(function(a) {
+                        var inC = (cart[a.id] && cart[a.id].quantity) || 0;
+                        var eff = a.stock - inC;
+                        return (
+                          <button key={a.id} className="ab" onClick={function(){ addToCart(a); }} disabled={a.stock<=inC}>
+                            {inC>0 && <span className="bdg">{inC}</span>}
+                            <div className="an">{a.name}</div>
+                            <div className="ap">€ {a.price.toFixed(2)}</div>
+                            <div className={'as' + (eff<=5?' low':'')}>Bestand: {eff}</div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="cc">
+              <div className="cart">
+                <div className="ch">
+                  <span className="ct">🛒 Warenkorb{cartCount>0?' ('+cartCount+')':''}</span>
+                  {cartCount>0 && <button className="cc-btn" onClick={clearCart}>Leeren</button>}
+                </div>
+                <div className="cb">
+                  {cartItems.length===0
+                    ? <div className="ce"><span className="ce-i">🛒</span>Noch keine Artikel</div>
+                    : cartItems.map(function(entry) {
+                        var a=entry.article, q=entry.quantity;
+                        return (
+                          <div key={a.id} className="ci">
+                            <span className="cin">{a.name}</span>
+                            <div className="qc">
+                              <button className="qb" onClick={function(){ changeQty(a.id,-1); }}>−</button>
+                              <span className="qn">{q}</span>
+                              <button className="qb" onClick={function(){ changeQty(a.id,+1); }} disabled={q>=a.stock}>+</button>
+                            </div>
+                            <span className="cip">€ {(a.price*q).toFixed(2)}</span>
+                            <button className="cdl" onClick={function(){ removeFromCart(a.id); }}>✕</button>
+                          </div>
+                        );
+                      })
+                  }
+                </div>
+                <div className="cf">
+                  {lastBooking && (
+                    <div className="lbk">
+                      <div className="lbi">Zuletzt: <strong>€ {lastBooking.total.toFixed(2)}</strong></div>
+                      <button className="sb" onClick={function(){
+                        var bk = bookings.find(function(b){ return b.id===lastBooking.bookingId; });
+                        if (bk) askConfirm('Buchung stornieren?','Die letzte Buchung wird storniert und der Bestand wiederhergestellt.','↶',function(){ stornoBooking(bk); });
+                      }}>↶ Storno</button>
+                    </div>
+                  )}
+                  <div className="tr">
+                    <span className="tl">Gesamt</span>
+                    <span className="tv">€ {cartTotal.toFixed(2)}</span>
+                  </div>
+                  <button className="bkbtn" onClick={function(){ setPayInput(''); setNoChange(false); setShowPay(true); }} disabled={cartCount===0}>
+                    {cartCount===0 ? 'Artikel wählen …' : '💳 Zur Kasse · € ' + cartTotal.toFixed(2)}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── BEZAHL-MODAL ─────────────────────────────────────────────── */}
+        {showPay && (
+          <div className="pay-overlay" onClick={function(){ setShowPay(false); }}>
+            <div className="pay-modal" onClick={function(e){ e.stopPropagation(); }}>
+              <h3>💳 Bezahlung</h3>
+              <div className="pay-sub">Wie viel hat der Kunde gegeben?</div>
+              <div className="pay-total">
+                <span className="pay-total-lbl">Zu zahlen</span>
+                <span className="pay-total-val">€ {cartTotal.toFixed(2)}</span>
+              </div>
+              <div className="quick-btns">
+                {quickAmounts.map(function(amt,i) {
+                  var isExact = Math.abs(amt-cartTotal) < 0.001;
+                  return (
+                    <button key={i} className={'qkbtn' + (isExact?' exact':'')}
+                      onClick={function(){ setPayInput(isExact ? cartTotal.toFixed(2) : amt.toFixed(2)); }}>
+                      {isExact ? '✓ Exakt' : '€ ' + amt.toFixed(0)}
+                    </button>
+                  );
+                })}
+              </div>
+              <input className="pay-inp" type="number" step="0.01" min="0"
+                placeholder={'€ ' + cartTotal.toFixed(2)} value={payInput}
+                onChange={function(e){ setPayInput(e.target.value); }} autoFocus />
+
+              {paidNum > cartTotal + 0.001 && (
+                <div className={'tip-row' + (noChange?' on':'')} onClick={function(){ setNoChange(function(v){ return !v; }); }}>
+                  <span className="tip-label">
+                    🎉 Trinkgeld behalten
+                    {noChange && <span style={{fontSize:11,fontWeight:400,opacity:.8}}>(kein Rückgeld)</span>}
+                  </span>
+                  {noChange && <span className="tip-amount">+ € {(paidNum-cartTotal).toFixed(2)}</span>}
+                  <div className={'tip-toggle' + (noChange?' on':'')} />
+                </div>
+              )}
+
+              <div className={'chg-row' + (payInput===''?' neu' : (noChange && paidNum>cartTotal+0.001)?' pos' : rawChange>=0?' pos':' neg')}>
+                <span className="chg-lbl">
+                  {payInput==='' ? 'Betrag eingeben'
+                    : (noChange && paidNum>cartTotal+0.001) ? '🎉 Trinkgeld'
+                    : rawChange<0 ? '⚠️ Zu wenig'
+                    : 'Rückgeld'}
+                </span>
+                {payInput!=='' && (
+                  <span className={'chg-val' + ((noChange&&paidNum>cartTotal+0.001)||rawChange>=0?' pos':' neg')}>
+                    {(noChange && paidNum>cartTotal+0.001) ? '€ '+(paidNum-cartTotal).toFixed(2)
+                      : rawChange<0 ? '− € '+Math.abs(rawChange).toFixed(2)
+                      : '€ '+rawChange.toFixed(2)}
+                  </span>
+                )}
+              </div>
+
+              <div className="pay-actions">
+                <button className="pay-cancel" onClick={function(){ setShowPay(false); }}>Abbrechen</button>
+                <button className="pay-ok" onClick={handleBook} disabled={payInput!=='' && rawChange<0}>✓ Buchen</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── DASHBOARD ────────────────────────────────────────────────── */}
+        {view==='dashboard' && (
+          <div className="main">
+            <div className="dg">
+              <div className="dc"><div className="dl">Umsatz heute</div><div className="dv">€ {tRev.toFixed(2)}</div></div>
+              <div className="dc"><div className="dl">Buchungen</div><div className="dv">{tTx}</div></div>
+              <div className="dc"><div className="dl">Ø/Buchung</div><div className="dv">€ {tAvg.toFixed(2)}</div></div>
+            </div>
+            <div className="dash-tabs">
+              <button className={'dash-tab'+(dashTab==='stats'?' on':'')} onClick={function(){ setDashTab('stats'); }}>📈 Statistik</button>
+              <button className={'dash-tab'+(dashTab==='bookings'?' on':'')} onClick={function(){ setDashTab('bookings'); }}>
+                {'🧾 Buchungen' + (tBk.length>0?' ('+tBk.length+')':'')}
+              </button>
+            </div>
+
+            {dashTab==='stats' && (
+              <div>
+                <div className="exp-row">
+                  <button className="btn xl" onClick={function(){ exportStatsExcel(bookings,articles); }}>📊 Excel exportieren</button>
+                </div>
+                <div className="ds">
+                  <h2>🏆 Top Artikel heute</h2>
+                  {top5.length
+                    ? <div className="tl2">{top5.map(function(item){ return <div key={item[0]} className="ti"><span>{item[0]}</span><span className="tq">{item[1]}×</span></div>; })}</div>
+                    : <div className="emp">Noch keine Buchungen heute</div>}
+                </div>
+                {low.length>0 && (
+                  <div className="ds">
+                    <h2>⚠️ Niedriger Bestand</h2>
+                    <div className="tl2">
+                      {low.map(function(a){
+                        return <div key={a.id} className="wi"><span>{a.name}</span><span className={'wq'+(a.stock<=2?' crit':'')}>{a.stock} übrig</span></div>;
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {dashTab==='bookings' && (
+              <div>
+                <div className="exp-row">
+                  <button className="btn xl" onClick={function(){ exportBookingsExcel(bookings); }}>📊 Excel exportieren</button>
+                </div>
+                <div className="bklist">
+                  {bookings.length===0
+                    ? <div className="emp">Noch keine Buchungen vorhanden</div>
+                    : bookings.map(function(b) {
+                        var isOpen = openBk===b.id;
+                        var chg = b.change || 0;
+                        return (
+                          <div key={b.id} className="bkcard">
+                            <div className="bkhead" onClick={function(){ setOpenBk(isOpen?null:b.id); }}>
+                              <div className="bkmeta">
+                                <div className="bktime">{fmtDate(b.timestamp)} · {fmtTime(b.timestamp)}</div>
+                                <div className="bksum">{b.items.length} Artikel · <strong style={{color:'#3b82f6'}}>€ {b.total.toFixed(2)}</strong></div>
+                              </div>
+                              <div className="bkmoney">
+                                {b.paid != null && <span className="bkpaid">Gegeben: € {b.paid.toFixed(2)}</span>}
+                                {b.paid != null && (
+                                  b.tip > 0
+                                    ? <span className="bkchg tip">🎉 Trinkgeld: € {b.tip.toFixed(2)}</span>
+                                    : <span className={'bkchg'+(Math.abs(chg)<0.001?' exact':'')}>
+                                        {Math.abs(chg)<0.001?'Kein Rückgeld':'Rückgeld: € '+chg.toFixed(2)}
+                                      </span>
+                                )}
+                              </div>
+                              <span className={'bkchev'+(isOpen?' open':'')}>▼</span>
+                            </div>
+                            {isOpen && (
+                              <div className="bkbody">
+                                {b.items.map(function(item,i){
+                                  return (
+                                    <div key={i} className="bkitem">
+                                      <span>{item.name}</span>
+                                      <span style={{color:'#6b7280',fontSize:11}}>{item.quantity}× € {item.price.toFixed(2)} = <strong>€ {item.totalPrice.toFixed(2)}</strong></span>
+                                    </div>
+                                  );
+                                })}
+                                <div className="bkfoot">
+                                  <button className="btn s" onClick={function(){
+                                    askConfirm('Buchung stornieren?','Buchung über € '+b.total.toFixed(2)+' wird storniert. Lagerbestand wird wiederhergestellt.','↶',function(){ stornoBooking(b); });
+                                  }}>↶ Storno</button>
+                                  <button className="btn s d" onClick={function(){
+                                    askConfirm('Buchung löschen?','Die Buchung wird entfernt. Lagerbestand bleibt unverändert.','🗑',function(){ deleteBooking(b); });
+                                  }}>🗑 Löschen</button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })
+                  }
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── VERWALTUNG ───────────────────────────────────────────────── */}
+        {view==='admin' && (
+          <div className="main">
+            <div className="reset-card">
+              <h3>🔄 Neuer Tag – Kasse zurücksetzen</h3>
+              <p>Löscht alle Buchungen, Verkäufe und Statistiken. Artikel und Preise bleiben erhalten.</p>
+              <button className="btn d" onClick={function(){
+                askConfirm('Kasse zurücksetzen?','Alle Buchungen und Statistiken werden unwiderruflich gelöscht. Artikel bleiben erhalten.','🔄', handleFullReset);
+              }}>🔄 Kasse zurücksetzen</button>
+            </div>
+            <div className="divider" />
+            <div className="ah">
+              <div className="row">
+                <input className="sr" placeholder="Artikel suchen…" value={search} onChange={function(e){ setSearch(e.target.value); }} />
+                <button className="btn p" onClick={function(){ setShowNew(true); }}>+ Neuer Artikel</button>
+              </div>
+              <div className="row" style={{justifyContent:'space-between'}}>
+                <div className="fr">
+                  {[['all','Alle'],['active','Aktiv'],['inactive','Inaktiv']].map(function(item){
+                    return <button key={item[0]} className={'fb'+(filter===item[0]?' on':'')} onClick={function(){ setFilter(item[0]); }}>{item[1]}</button>;
+                  })}
+                </div>
+                <div className="row">
+                  <button className="btn" onClick={handleExportCSV}>📋 CSV Export</button>
+                  <label className="btn" style={{cursor:'pointer'}}>
+                    📥 Import
+                    <input ref={fileRef} type="file" accept=".csv" style={{display:'none'}} onChange={handleImport} />
+                  </label>
+                  <button className="tgl" onClick={function(){ setTheme(function(t){ return t==='light'?'dark':'light'; }); }}>
+                    {dark?'☀️':'🌙'}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="al">
+              {filtered.map(function(a){
+                return (
+                  <div key={a.id} className={'ar'+(a.active?'':' off')}>
+                    <div className="ai">
+                      <div className="an">{a.name}</div>
+                      <div className="am">{a.category} · € {a.price.toFixed(2)}</div>
+                    </div>
+                    <div className="ask">Bestand: {a.stock}</div>
+                    <div className="acs">
+                      <button className="btn s" onClick={function(){ openEdit(a); }}>✏️ Bearbeiten</button>
+                      <button className={'btn s '+(a.active?'g':'m')} onClick={function(){ toggleActive(a.id); }}>
+                        {a.active?'✓ Aktiv':'✗ Inaktiv'}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+              {filtered.length===0 && <div className="emp">Keine Artikel gefunden</div>}
+            </div>
+
+            {showNew && (
+              <div className="ov" onClick={function(){ setShowNew(false); }}>
+                <div className="mod" onClick={function(e){ e.stopPropagation(); }}>
+                  <h3>Neuer Artikel</h3>
+                  <input className="ff" placeholder="Name" value={newA.name} onChange={function(e){ setNewA(Object.assign({},newA,{name:e.target.value})); }} />
+                  <select className="ff" value={newA.category} onChange={function(e){ setNewA(Object.assign({},newA,{category:e.target.value})); }}>
+                    {CATEGORIES.map(function(c){ return <option key={c}>{c}</option>; })}
+                  </select>
+                  <input className="ff" type="number" placeholder="Preis (€)" step="0.01" min="0" value={newA.price} onChange={function(e){ setNewA(Object.assign({},newA,{price:e.target.value})); }} />
+                  <input className="ff" type="number" placeholder="Startbestand" min="0" value={newA.stock} onChange={function(e){ setNewA(Object.assign({},newA,{stock:e.target.value})); }} />
+                  <div className="mf">
+                    <button className="btn p" onClick={handleAddNew}>Hinzufügen</button>
+                    <button className="btn" onClick={function(){ setShowNew(false); }}>Abbrechen</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {editId && (
+              <div className="ov" onClick={function(){ setEditId(null); }}>
+                <div className="mod" onClick={function(e){ e.stopPropagation(); }}>
+                  <h3>Artikel bearbeiten</h3>
+                  <input className="ff" placeholder="Name" value={editBuf.name||''} onChange={function(e){ setEditBuf(Object.assign({},editBuf,{name:e.target.value})); }} />
+                  <select className="ff" value={editBuf.category||'Alkoholfreie Getränke'} onChange={function(e){ setEditBuf(Object.assign({},editBuf,{category:e.target.value})); }}>
+                    {CATEGORIES.map(function(c){ return <option key={c}>{c}</option>; })}
+                  </select>
+                  <input className="ff" type="number" step="0.01" min="0" placeholder="Preis (€)" value={editBuf.price!=null?editBuf.price:''} onChange={function(e){ setEditBuf(Object.assign({},editBuf,{price:parseFloat(e.target.value)||0})); }} />
+                  <input className="ff" type="number" min="0" placeholder="Bestand" value={editBuf.stock!=null?editBuf.stock:''} onChange={function(e){ setEditBuf(Object.assign({},editBuf,{stock:parseInt(e.target.value)||0})); }} />
+                  <div className="mf">
+                    <button className="btn p" onClick={handleSaveEdit}>💾 Speichern</button>
+                    <button className="btn d" onClick={function(){
+                      askConfirm('Artikel löschen?','"'+editBuf.name+'" wird dauerhaft entfernt.','🗑',function(){ handleDeleteArt(editId); });
+                    }}>🗑 Löschen</button>
+                    <button className="btn" onClick={function(){ setEditId(null); }}>✕</button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>

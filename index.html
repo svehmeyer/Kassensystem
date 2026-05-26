@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-<title>Party-Kasse v1.3.1</title>
+<title>Party-Kasse v1.3.2</title>
 <script>/* https://unpkg.com/react@18/umd/react.production.min.js */
 /**
  * @license React
@@ -571,7 +571,8 @@ function buildCSS(dark, themeName) {
     '.sc-l{font-size:9px;color:' + muted + ';text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}',
     '.sc-v{font-size:16px;font-weight:700;color:' + accent + '}',
     '.sec{margin-bottom:12px;background:' + surface + ';border:1.5px solid ' + border + ';border-radius:14px;overflow:hidden;transition:box-shadow .2s}',
-    '.sec.dragging{box-shadow:0 8px 24px rgba(0,0,0,.18);opacity:.95;z-index:100;position:relative}',
+    '.sec.dragging{box-shadow:0 12px 28px rgba(0,0,0,.22);opacity:.96;z-index:100;position:relative;transition:none}',
+    '.sec.shifted{transition:transform .22s cubic-bezier(.2,.8,.2,1)}',
     '.sec-drag-row{display:flex;align-items:center;gap:0;border-bottom:1px solid ' + border + '}',
     '.drag-handle{width:36px;flex-shrink:0;display:flex;align-items:center;justify-content:center;padding:10px 0;cursor:grab;color:' + muted + ';font-size:18px;border-right:1px solid ' + border + ';background:' + card + ';user-select:none;-webkit-user-select:none;touch-action:none}',
     '.drag-handle:active{cursor:grabbing;background:' + border + '}',
@@ -977,27 +978,53 @@ function App() {
   })();
 
   // ── BUCHEN ─────────────────────────────────────────────────────────────────
-  function doDragMove(clientY) {
-    var items = Array.from(document.querySelectorAll('.ac .sec'));
-    if (!items.length || !catOrder) return;
-    var closest = 0, closestDist = Infinity;
-    items.forEach(function(el, i) {
-      var r = el.getBoundingClientRect();
-      var dist = Math.abs(clientY - (r.top + r.height / 2));
-      if (dist < closestDist) { closestDist = dist; closest = i; }
-    });
+  function commitCatOrder(fromIdx, toIdx) {
+    if (fromIdx === toIdx) return;
     var allCats = categories.slice().sort(function(a,b){ return a.order - b.order; });
     var visCats = allCats.filter(function(c){ return c.visible; });
-    var dragIdx = visCats.findIndex(function(c){ return c.id === catOrder.id; });
-    if (dragIdx !== -1 && dragIdx !== closest) {
-      var item = visCats.splice(dragIdx, 1)[0];
-      visCats.splice(closest, 0, item);
-      visCats.forEach(function(c, i){ c.order = i; });
-      var hidCats = allCats.filter(function(c){ return !c.visible; });
-      hidCats.forEach(function(c, i){ c.order = visCats.length + i; });
-      saveCategories(visCats.concat(hidCats));
-    }
+    if (fromIdx < 0 || fromIdx >= visCats.length || toIdx < 0 || toIdx >= visCats.length) return;
+    var item = visCats.splice(fromIdx, 1)[0];
+    visCats.splice(toIdx, 0, item);
+    visCats.forEach(function(c, i){ c.order = i; });
+    var hidCats = allCats.filter(function(c){ return !c.visible; });
+    hidCats.forEach(function(c, i){ c.order = visCats.length + i; });
+    saveCategories(visCats.concat(hidCats));
   }
+
+  useEffect(function(){
+    if (!catOrder) return;
+    var totalRows = byCategory.length;
+    var rowH = catOrder.rowHeight || 60;
+    var startY = catOrder.startY;
+    var fromIdx = catOrder.fromIdx;
+
+    function handleMove(e){
+      e.preventDefault();
+      var y = e.clientY;
+      var delta = y - startY;
+      var moved = Math.round(delta / rowH);
+      var toIdx = Math.max(0, Math.min(totalRows - 1, fromIdx + moved));
+      setCatOrder(function(prev){
+        if (!prev) return prev;
+        if (prev.delta === delta && prev.toIdx === toIdx) return prev;
+        return Object.assign({}, prev, { delta: delta, toIdx: toIdx });
+      });
+    }
+    function handleUp(){
+      setCatOrder(function(prev){
+        if (prev) commitCatOrder(prev.fromIdx, prev.toIdx);
+        return null;
+      });
+    }
+    window.addEventListener('pointermove', handleMove, { passive: false });
+    window.addEventListener('pointerup', handleUp);
+    window.addEventListener('pointercancel', handleUp);
+    return function(){
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+      window.removeEventListener('pointercancel', handleUp);
+    };
+  }, [catOrder ? catOrder.id : null]);
 
   function handleBook() {
     if (!cartItems.length) return;
@@ -1469,19 +1496,43 @@ function App() {
               </div>
               {byCategory.map(function(g, gIdx) {
                 var isDragging = catOrder && catOrder.id === g.catId;
+                var dragStyle = {};
+                if (catOrder && catOrder.delta != null) {
+                  if (isDragging) {
+                    dragStyle = { transform: 'translateY(' + catOrder.delta + 'px)' };
+                  } else {
+                    var fromIdx = catOrder.fromIdx;
+                    var toIdx   = catOrder.toIdx;
+                    var rowH    = catOrder.rowHeight || 0;
+                    if (fromIdx !== toIdx && rowH > 0) {
+                      if (fromIdx < gIdx && gIdx <= toIdx) {
+                        dragStyle = { transform: 'translateY(' + (-rowH) + 'px)' };
+                      } else if (toIdx <= gIdx && gIdx < fromIdx) {
+                        dragStyle = { transform: 'translateY(' + rowH + 'px)' };
+                      }
+                    }
+                  }
+                }
                 return (
-                  <div key={g.cat} className={'sec'+(isDragging?' dragging':'')}>
+                  <div key={g.cat} className={'sec'+(isDragging?' dragging':' shifted')} style={dragStyle}>
                     <div className="sec-drag-row">
                       <div
                         className="drag-handle"
                         title="Reihenfolge verschieben"
-                        onMouseDown={function(e){
+                        onPointerDown={function(e){
                           e.preventDefault();
-                          setCatOrder({id:g.catId, startY:e.clientY});
-                        }}
-                        onTouchStart={function(e){
-                          e.preventDefault();
-                          setCatOrder({id:g.catId, startY:e.touches[0].clientY});
+                          var secEl = e.currentTarget.closest('.sec');
+                          var rect = secEl ? secEl.getBoundingClientRect() : {height:60};
+                          try { e.currentTarget.setPointerCapture(e.pointerId); } catch(err){}
+                          setCatOrder({
+                            id: g.catId,
+                            fromIdx: gIdx,
+                            toIdx: gIdx,
+                            startY: e.clientY,
+                            delta: 0,
+                            rowHeight: rect.height + 12,
+                            pointerId: e.pointerId
+                          });
                         }}
                       >⠿</div>
                       <div className="sec-title-wrap">
@@ -1510,12 +1561,7 @@ function App() {
                 );
               })}
               {catOrder && (
-                <div style={{position:'fixed',inset:0,zIndex:200,cursor:'grabbing'}}
-                  onMouseMove={function(e){ doDragMove(e.clientY); }}
-                  onTouchMove={function(e){ e.preventDefault(); doDragMove(e.touches[0].clientY); }}
-                  onMouseUp={function(){ setCatOrder(null); }}
-                  onTouchEnd={function(){ setCatOrder(null); }}
-                />
+                <div style={{position:'fixed',inset:0,zIndex:200,cursor:'grabbing',background:'transparent',touchAction:'none'}} />
               )}
             </div>
 
@@ -2259,7 +2305,7 @@ function App() {
           </div>
         )}
 
-      <div className="version-badge">v1.3.1</div>
+      <div className="version-badge">v1.3.2</div>
       </div>
     </div>
   );
